@@ -2229,9 +2229,11 @@ fn opencode_entry_from_mcp(
 
     match &config.transport {
         McpTransport::Http { endpoint, headers } => {
+            // OpenCode's schema for HTTP servers is `type: "remote"` + `url`;
+            // it silently drops any other shape.
             let mut entry = serde_json::Map::new();
-            entry.insert("type".to_string(), json!("http"));
-            entry.insert("endpoint".to_string(), json!(endpoint));
+            entry.insert("type".to_string(), json!("remote"));
+            entry.insert("url".to_string(), json!(endpoint));
             entry.insert("enabled".to_string(), json!(config.enabled));
             if !headers.is_empty() {
                 entry.insert("headers".to_string(), json!(headers));

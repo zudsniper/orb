@@ -2058,6 +2058,36 @@ mod tests {
     }
 
     #[test]
+    fn http_mcp_uses_opencode_remote_schema() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let workspace_root = temp.path();
+        let mission_dir = workspace_root.join("workspaces/mission-deadbeef");
+        let mut mcp = McpServerConfig::new(
+            "remote_docs".to_string(),
+            "https://example.test/mcp".to_string(),
+        );
+        if let McpTransport::Http { headers, .. } = &mut mcp.transport {
+            headers.insert("X-Test".to_string(), "1".to_string());
+        }
+
+        let entry = opencode_entry_from_mcp(
+            &mcp,
+            &mission_dir,
+            workspace_root,
+            WorkspaceType::Host,
+            &HashMap::new(),
+            None,
+        )
+        .expect("HTTP MCP entry");
+
+        assert_eq!(entry["type"], "remote");
+        assert_eq!(entry["url"], "https://example.test/mcp");
+        assert_eq!(entry["enabled"], true);
+        assert_eq!(entry["headers"]["X-Test"], "1");
+        assert!(entry.get("endpoint").is_none());
+    }
+
+    #[test]
     fn sanitized_mcp_name_collisions_get_distinct_launchers() {
         let temp = tempfile::TempDir::new().unwrap();
         let workspace_root = temp.path();
