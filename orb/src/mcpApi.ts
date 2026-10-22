@@ -59,9 +59,36 @@ export async function mcpLogs(id: string, tail = 300): Promise<McpLogEntry[]> {
   }
 }
 
-/** Reconnect and rediscover tools; resolves once Core's check finishes. */
-export async function refreshMcp(id: string): Promise<void> {
+const isCheckStart = (e: McpLogEntry) => e.kind === "event" && e.message.startsWith("Refreshing (");
+const isCheckEnd = (e: McpLogEntry) => e.kind === "event" && (e.message.startsWith("Connected:") || e.message.startsWith("Error:"));
+const lastCheckStart = (entries: McpLogEntry[]) => {
+  for (let i = entries.length - 1; i >= 0; i--) if (isCheckStart(entries[i])) return i;
+  return -1;
+};
+
+export interface RefreshOptions { timeoutMs?: number; intervalMs?: number }
+
+/** Reconnect and rediscover tools. Core runs the check in the background, so
+ * this waits until the log records its outcome. Resolves `false` if the check
+ * is still running at the timeout, or Core keeps no logs to tell. */
+export async function refreshMcp(id: string, { timeoutMs = 60_000, intervalMs = 500 }: RefreshOptions = {}): Promise<boolean> {
+  let previous: string | undefined;
+  try {
+    const before = await mcpLogs(id);
+    previous = before[lastCheckStart(before)]?.at;
+  } catch (e) {
+    if (!(e instanceof UnsupportedEndpoint)) throw e;
+    await api<unknown>(`/api/mcp/${enc(id)}/refresh`, { method: "POST" });
+    return false;
+  }
   await api<unknown>(`/api/mcp/${enc(id)}/refresh`, { method: "POST" });
+  for (const deadline = Date.now() + timeoutMs; Date.now() < deadline;) {
+    await new Promise(resolve => setTimeout(resolve, intervalMs));
+    const entries = await mcpLogs(id);
+    const start = lastCheckStart(entries);
+    if (start >= 0 && entries[start].at !== previous && entries.slice(start + 1).some(isCheckEnd)) return true;
+  }
+  return false;
 }
 
 export type McpStatusView = { label: string; dot: "on" | "off" | "idle" };

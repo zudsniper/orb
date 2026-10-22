@@ -56,7 +56,10 @@ function McpRow(p: { mcp: () => McpSummary; onRefreshed: () => void }) {
   const refresh = async () => {
     if (busy()) return;
     setBusy(true); setError(null);
-    try { await refreshMcp(p.mcp().id); p.onRefreshed(); setLogVersion(v => v + 1); }
+    try {
+      if (!await refreshMcp(p.mcp().id)) setError("Core is still checking. Reload the log in a moment.");
+      p.onRefreshed(); setLogVersion(v => v + 1);
+    }
     catch (e) { setError(message(e)); }
     finally { setBusy(false); }
   };

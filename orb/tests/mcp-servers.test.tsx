@@ -56,13 +56,16 @@ it("lists the host workspace's servers with status, tools and errors", async () 
 it("shows a server's log and refreshes it", async () => {
   setConnection("http://core.test", "test-token");
   const id = "11111111-1111-1111-1111-111111111111";
-  let refreshed = false;
+  let refreshed = false, polls = 0;
   const fetch = stubCore({
     "GET /api/workspaces": () => json([{ id: HOST_WORKSPACE_ID, name: "host" }]),
     [`GET /api/workspaces/${HOST_WORKSPACE_ID}/mcps`]: () => json([summary({ tools: ["echo"] })]),
-    [`GET /api/mcp/${id}/logs?tail=300`]: () => json({ id, entries: refreshed
-      ? [{ at: "2026-10-22T04:30:00Z", kind: "event", message: "Connected: 1 tool(s)" }]
-      : [{ at: "2026-10-22T04:29:00Z", kind: "stderr", message: "server booting" }] }),
+    // Core checks in the background: the outcome shows up a poll after the POST.
+    [`GET /api/mcp/${id}/logs?tail=300`]: () => json({ id, entries: [
+      { at: "2026-10-22T04:29:00Z", kind: "stderr", message: "server booting" },
+      ...(refreshed ? [{ at: "2026-10-22T04:30:00Z", kind: "event", message: "Refreshing (stdio npx)" }] : []),
+      ...(refreshed && polls++ > 0 ? [{ at: "2026-10-22T04:30:01Z", kind: "event", message: "Connected: 1 tool(s)" }] : []),
+    ] }),
     [`POST /api/mcp/${id}/refresh`]: () => { refreshed = true; return json(summary({})); },
   });
   render(() => <McpServersPanel />);
@@ -70,7 +73,8 @@ it("shows a server's log and refreshes it", async () => {
   openRow("smoke");
   await waitFor(() => expect(screen.getByLabelText("MCP server log").textContent).toContain("stderr server booting"));
   fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
-  await waitFor(() => expect(screen.getByLabelText("MCP server log").textContent).toContain("Connected: 1 tool(s)"));
+  await waitFor(() => expect(screen.getByLabelText("MCP server log").textContent).toContain("Connected: 1 tool(s)"), { timeout: 4000 });
+  expect(screen.queryByRole("alert")).toBeNull();
   expect(fetch.mock.calls.some(([url, init]) => url.endsWith("/refresh") && init?.method === "POST")).toBe(true);
 });
 
