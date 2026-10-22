@@ -40,6 +40,8 @@ pub fn routes() -> Router<Arc<super::routes::AppState>> {
         .route("/:id/debug", get(get_workspace_debug))
         .route("/:id/rerun-init", post(rerun_init_script))
         .route("/:id/init-log", get(get_init_log))
+        // MCP servers a mission in this workspace gets
+        .route("/:id/mcps", get(get_workspace_mcps))
         // Memory monitoring
         .route("/:id/memory", get(get_workspace_memory))
         .route("/memory/all", get(get_all_workspaces_memory))
@@ -1583,6 +1585,31 @@ async fn get_workspace_debug(
         distro: workspace.distro.clone(),
         last_error: workspace.error_message.clone(),
     }))
+}
+
+/// GET /api/workspaces/:id/mcps - The MCP servers missions in this workspace
+/// get, without transport details (commands, env, endpoints, headers).
+async fn get_workspace_mcps(
+    State(state): State<Arc<super::routes::AppState>>,
+    AxumPath(id): AxumPath<Uuid>,
+) -> Result<Json<Vec<crate::mcp::McpSummary>>, (StatusCode, String)> {
+    let workspace = require_workspace(&state.workspaces, id).await?;
+    let mut mcps: Vec<crate::mcp::McpSummary> = state
+        .mcp
+        .list()
+        .await
+        .iter()
+        .filter(|s| {
+            workspace::mcp_applies_to_workspace(
+                &s.config,
+                &workspace.mcps,
+                workspace.mcps_replace_defaults,
+            )
+        })
+        .map(Into::into)
+        .collect();
+    mcps.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(Json(mcps))
 }
 
 /// GET /api/workspaces/:id/init-log - Get the init script log from inside the container.

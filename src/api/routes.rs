@@ -1421,6 +1421,7 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
         .route("/api/mcp/:id/enable", post(mcp_api::enable_mcp))
         .route("/api/mcp/:id/disable", post(mcp_api::disable_mcp))
         .route("/api/mcp/:id/refresh", post(mcp_api::refresh_mcp))
+        .route("/api/mcp/:id/logs", get(mcp_api::get_mcp_logs))
         // Tools management endpoints
         .route("/api/tools", get(mcp_api::list_tools))
         .route("/api/tools/:name/toggle", post(mcp_api::toggle_tool))

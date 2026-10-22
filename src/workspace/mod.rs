@@ -3385,14 +3385,41 @@ pub(crate) async fn install_remote_build_wrapper(
     Ok(())
 }
 
-/// Filter MCP configs based on a workspace's MCP allowlist.
+/// Whether a workspace's missions get this MCP, given the workspace's MCP allowlist.
 ///
-/// - Empty `workspace_mcps` → include only MCPs with `default_enabled = true`
+/// - Empty `workspace_mcps` → only MCPs with `default_enabled = true`
 ///   (`replace_defaults` is ignored in this case)
 /// - Non-empty `workspace_mcps` + `replace_defaults = true` → **only** the allowlist
 /// - Non-empty `workspace_mcps` + `replace_defaults = false` → allowlist **plus** `default_enabled` MCPs
 ///
 /// In all cases, globally disabled MCPs (`enabled = false`) are excluded.
+pub fn mcp_applies_to_workspace(
+    config: &McpServerConfig,
+    workspace_mcps: &[String],
+    replace_defaults: bool,
+) -> bool {
+    // Globally disabled MCPs are always excluded
+    if !config.enabled {
+        return false;
+    }
+    if workspace_mcps.is_empty() {
+        // No explicit list → fall back to default MCPs
+        return config.default_enabled;
+    }
+    let in_list = workspace_mcps
+        .iter()
+        .any(|name| name == &config.name || (name == "orchestrator" && config.name == "sandboxed"));
+    if replace_defaults {
+        // Explicit list is the complete set — only listed MCPs
+        in_list
+    } else {
+        // Additive mode — listed MCPs + all default-enabled MCPs
+        in_list || config.default_enabled
+    }
+}
+
+/// Filter MCP configs based on a workspace's MCP allowlist
+/// (see [`mcp_applies_to_workspace`]).
 fn filter_mcp_configs_for_workspace(
     configs: Vec<McpServerConfig>,
     workspace_mcps: &[String],
@@ -3400,27 +3427,7 @@ fn filter_mcp_configs_for_workspace(
 ) -> Vec<McpServerConfig> {
     configs
         .into_iter()
-        .filter(|c| {
-            // Globally disabled MCPs are always excluded
-            if !c.enabled {
-                return false;
-            }
-            if workspace_mcps.is_empty() {
-                // No explicit list → fall back to default MCPs
-                c.default_enabled
-            } else {
-                let in_list = workspace_mcps.iter().any(|name| {
-                    name == &c.name || (name == "orchestrator" && c.name == "sandboxed")
-                });
-                if replace_defaults {
-                    // Explicit list is the complete set — only listed MCPs
-                    in_list
-                } else {
-                    // Additive mode — listed MCPs + all default-enabled MCPs
-                    in_list || c.default_enabled
-                }
-            }
-        })
+        .filter(|c| mcp_applies_to_workspace(c, workspace_mcps, replace_defaults))
         .collect()
 }
 

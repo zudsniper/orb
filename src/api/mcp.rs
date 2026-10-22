@@ -11,7 +11,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::mcp::{AddMcpRequest, McpServerState, UpdateMcpRequest};
+use crate::mcp::{AddMcpRequest, McpLogEntry, McpServerState, UpdateMcpRequest};
 use crate::tools::ToolRegistry;
 use crate::workspace;
 
@@ -36,6 +36,31 @@ pub async fn get_mcp(
         .await
         .map(Json)
         .ok_or_else(|| (StatusCode::NOT_FOUND, format!("MCP {} not found", id)))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct McpLogsQuery {
+    /// Number of most recent entries to return (default and max 300).
+    pub tail: Option<usize>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct McpLogsResponse {
+    pub id: Uuid,
+    pub entries: Vec<McpLogEntry>,
+}
+
+/// Recent stderr lines and connection events for an MCP server.
+pub async fn get_mcp_logs(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<Uuid>,
+    axum::extract::Query(query): axum::extract::Query<McpLogsQuery>,
+) -> Result<Json<McpLogsResponse>, (StatusCode, String)> {
+    if state.mcp.get(id).await.is_none() {
+        return Err((StatusCode::NOT_FOUND, format!("MCP {} not found", id)));
+    }
+    let entries = state.mcp.logs(id, query.tail.unwrap_or(usize::MAX));
+    Ok(Json(McpLogsResponse { id, entries }))
 }
 
 /// Add a new MCP server.

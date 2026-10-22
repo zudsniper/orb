@@ -11,17 +11,123 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use futures::StreamExt;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::{Mutex, RwLock};
 use uuid::Uuid;
 
 use super::config::McpConfigStore;
+use super::logs::{McpLogEntry, McpLogKind, McpLogStore};
 use super::types::*;
 use crate::util::current_service_companion_binary_path;
 
 /// MCP protocol version we support
 const MCP_PROTOCOL_VERSION: &str = "2024-11-05";
+
+/// Streamable HTTP servers answer either with JSON or an SSE stream and
+/// reject requests (406) that don't accept both.
+const HTTP_ACCEPT: &str = "application/json, text/event-stream";
+/// Upper bound on a buffered SSE event, so a stream without event
+/// boundaries can't grow without limit.
+const SSE_EVENT_MAX: usize = 8 * 1024 * 1024;
+/// Session id a Streamable HTTP server may assign at initialize.
+const MCP_SESSION_HEADER: &str = "mcp-session-id";
+
+/// Pop the next complete event from an SSE byte buffer and return its joined
+/// `data:` payload. Carriage returns must already be stripped.
+fn take_sse_event(buffer: &mut Vec<u8>) -> Option<String> {
+    let end = buffer.windows(2).position(|w| w == b"\n\n")?;
+    let event: Vec<u8> = buffer.drain(..end + 2).collect();
+    let event = String::from_utf8_lossy(&event);
+    let data: Vec<&str> = event
+        .lines()
+        .filter_map(|line| line.strip_prefix("data:"))
+        .map(|data| data.strip_prefix(' ').unwrap_or(data))
+        .collect();
+    Some(data.join("\n"))
+}
+
+/// Parse one JSON-RPC message (or batch) and return the response to
+/// `request_id`. Notifications, server-to-client requests, responses to other
+/// ids and non-JSON lines yield `None`. An error without an id is taken as
+/// the response, since the server couldn't tell which request it rejects.
+fn parse_matching_response(payload: &str, request_id: u64) -> Option<JsonRpcResponse> {
+    let value: serde_json::Value = serde_json::from_str(payload.trim()).ok()?;
+    let messages = match value {
+        serde_json::Value::Array(items) => items,
+        other => vec![other],
+    };
+    messages.into_iter().find_map(|message| {
+        if message.get("method").is_some() {
+            return None;
+        }
+        match message.get("id") {
+            Some(id) if id.as_u64() == Some(request_id) => {}
+            // A parse/invalid-request error can't name the request it rejects;
+            // with one request in flight per call it is ours.
+            Some(serde_json::Value::Null) | None if message.get("error").is_some() => {}
+            _ => return None,
+        }
+        serde_json::from_value(message).ok()
+    })
+}
+
+fn into_result(response: JsonRpcResponse) -> anyhow::Result<serde_json::Value> {
+    if let Some(error) = response.error {
+        anyhow::bail!("JSON-RPC error {}: {}", error.code, error.message);
+    }
+    response
+        .result
+        .ok_or_else(|| anyhow::anyhow!("No result in response"))
+}
+
+/// Read an SSE response until the event carrying the response to `request_id`.
+async fn read_sse_response(
+    response: reqwest::Response,
+    request_id: u64,
+) -> anyhow::Result<JsonRpcResponse> {
+    let mut stream = response.bytes_stream();
+    let mut buffer = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| e.without_url())?;
+        buffer.extend(chunk.iter().copied().filter(|b| *b != b'\r'));
+        while let Some(data) = take_sse_event(&mut buffer) {
+            if let Some(found) = parse_matching_response(&data, request_id) {
+                return Ok(found);
+            }
+        }
+        if buffer.len() > SSE_EVENT_MAX {
+            anyhow::bail!(
+                "Event stream sent more than {} bytes without an event boundary",
+                SSE_EVENT_MAX
+            );
+        }
+    }
+    // A final event may lack the terminating blank line.
+    buffer.extend_from_slice(b"\n\n");
+    take_sse_event(&mut buffer)
+        .and_then(|data| parse_matching_response(&data, request_id))
+        .ok_or_else(|| anyhow::anyhow!("Event stream ended without a response"))
+}
+
+/// Short, secret-free description of a transport for log events: the origin
+/// of an HTTP endpoint (no path or query) or the stdio command's file name.
+fn transport_label(transport: &McpTransport) -> String {
+    match transport {
+        McpTransport::Http { endpoint, .. } => match reqwest::Url::parse(endpoint) {
+            Ok(url) => format!("http {}", url.origin().ascii_serialization()),
+            Err(_) => "http".to_string(),
+        },
+        McpTransport::Stdio { command, .. } => {
+            let name = Path::new(command)
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| command.clone());
+            format!("stdio {}", name)
+        }
+    }
+}
 
 /// Sanitize MCP server name to create a valid function name prefix.
 ///
@@ -133,6 +239,10 @@ pub struct McpRegistry {
     disabled_tools: RwLock<std::collections::HashSet<String>>,
     /// Request ID counter for JSON-RPC
     request_id: AtomicU64,
+    /// Recent stderr lines and connection events (keyed by ID)
+    logs: Arc<McpLogStore>,
+    /// Streamable HTTP session ids assigned by servers (keyed by ID)
+    http_sessions: RwLock<HashMap<Uuid, String>>,
 }
 
 const MCP_REQUEST_TIMEOUT: Duration = Duration::from_secs(600);
@@ -147,7 +257,9 @@ impl McpRegistry {
         let mut configs = config_store.list().await;
         configs = Self::ensure_defaults(&config_store, configs, working_dir).await;
         let mut states = HashMap::new();
+        let logs = Arc::new(McpLogStore::default());
         for config in configs {
+            logs.register(config.id, &config.transport);
             states.insert(config.id, McpServerState::from_config(config));
         }
 
@@ -165,7 +277,14 @@ impl McpRegistry {
             stdio_processes: RwLock::new(HashMap::new()),
             disabled_tools: RwLock::new(std::collections::HashSet::new()),
             request_id: AtomicU64::new(1),
+            logs,
+            http_sessions: RwLock::new(HashMap::new()),
         }
+    }
+
+    /// The most recent log entries for an MCP, oldest first.
+    pub fn logs(&self, id: Uuid, limit: usize) -> Vec<McpLogEntry> {
+        self.logs.tail(id, limit)
     }
 
     /// Return the raw MCP configs (for workspace opencode.json generation).
@@ -577,41 +696,86 @@ impl McpRegistry {
         self.request_id.fetch_add(1, Ordering::SeqCst)
     }
 
-    /// Send a JSON-RPC request via HTTP
-    async fn send_jsonrpc_http(
+    /// POST a JSON-RPC message to an HTTP MCP. Carries the session id the
+    /// server assigned at initialize and records a newly assigned one.
+    async fn post_http(
         &self,
+        mcp_id: Uuid,
         endpoint: &str,
-        method: &str,
-        params: Option<serde_json::Value>,
         headers: &HashMap<String, String>,
-    ) -> anyhow::Result<serde_json::Value> {
-        let request = JsonRpcRequest::new(self.next_request_id(), method, params);
-
+        body: &serde_json::Value,
+    ) -> anyhow::Result<reqwest::Response> {
         let mut req_builder = self
             .http_client
             .post(endpoint)
-            .header("Content-Type", "application/json");
+            .header("Content-Type", "application/json")
+            .header("Accept", HTTP_ACCEPT);
+
+        if let Some(session) = self.http_sessions.read().await.get(&mcp_id) {
+            req_builder = req_builder.header(MCP_SESSION_HEADER, session.as_str());
+        }
 
         // Add custom headers
         for (key, value) in headers {
             req_builder = req_builder.header(key.as_str(), value.as_str());
         }
 
-        let response = req_builder.json(&request).send().await?;
+        let response = req_builder
+            .json(body)
+            .send()
+            .await
+            .map_err(|e| e.without_url())?;
+
+        if let Some(session) = response
+            .headers()
+            .get(MCP_SESSION_HEADER)
+            .and_then(|v| v.to_str().ok())
+        {
+            self.http_sessions
+                .write()
+                .await
+                .insert(mcp_id, session.to_string());
+        }
+
+        Ok(response)
+    }
+
+    /// Send a JSON-RPC request via HTTP (plain JSON or Streamable HTTP SSE).
+    async fn send_jsonrpc_http(
+        &self,
+        mcp_id: Uuid,
+        endpoint: &str,
+        method: &str,
+        params: Option<serde_json::Value>,
+        headers: &HashMap<String, String>,
+    ) -> anyhow::Result<serde_json::Value> {
+        let request = JsonRpcRequest::new(self.next_request_id(), method, params);
+        let request_id = request.id;
+
+        let response = self
+            .post_http(mcp_id, endpoint, headers, &serde_json::to_value(&request)?)
+            .await?;
 
         if !response.status().is_success() {
             anyhow::bail!("HTTP {}", response.status());
         }
 
-        let json_response: JsonRpcResponse = response.json().await?;
+        let is_event_stream = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| v.starts_with("text/event-stream"));
 
-        if let Some(error) = json_response.error {
-            anyhow::bail!("JSON-RPC error {}: {}", error.code, error.message);
-        }
+        let json_response = if is_event_stream {
+            read_sse_response(response, request_id).await?
+        } else {
+            response
+                .json::<JsonRpcResponse>()
+                .await
+                .map_err(|e| e.without_url())?
+        };
 
-        json_response
-            .result
-            .ok_or_else(|| anyhow::anyhow!("No result in response"))
+        into_result(json_response)
     }
 
     /// Send a JSON-RPC request via stdio
@@ -622,6 +786,7 @@ impl McpRegistry {
         params: Option<serde_json::Value>,
     ) -> anyhow::Result<serde_json::Value> {
         let request = JsonRpcRequest::new(self.next_request_id(), method, params);
+        let request_id = request.id;
         let request_json = serde_json::to_string(&request)?;
 
         let mut proc = process.lock().await;
@@ -631,35 +796,31 @@ impl McpRegistry {
         proc.stdin.write_all(b"\n").await?;
         proc.stdin.flush().await?;
 
-        // Read response from stdout
+        // Read lines until the response to this request. Servers may emit
+        // notifications (e.g. logging) or their own requests first.
         let mut stdout = proc.stdout_lines.lock().await;
+        let deadline = tokio::time::Instant::now() + MCP_REQUEST_TIMEOUT;
         let mut line = String::new();
 
-        // Read with timeout
-        let read_result =
-            tokio::time::timeout(MCP_REQUEST_TIMEOUT, stdout.read_line(&mut line)).await;
-
-        match read_result {
-            Ok(Ok(0)) => anyhow::bail!("MCP process closed stdout"),
-            Ok(Ok(_)) => {
-                let json_response: JsonRpcResponse = serde_json::from_str(&line)?;
-
-                if let Some(error) = json_response.error {
-                    anyhow::bail!("JSON-RPC error {}: {}", error.code, error.message);
+        loop {
+            line.clear();
+            match tokio::time::timeout_at(deadline, stdout.read_line(&mut line)).await {
+                Ok(Ok(0)) => anyhow::bail!("MCP process closed stdout"),
+                Ok(Ok(_)) => {
+                    if let Some(response) = parse_matching_response(&line, request_id) {
+                        return into_result(response);
+                    }
                 }
-
-                json_response
-                    .result
-                    .ok_or_else(|| anyhow::anyhow!("No result in response"))
+                Ok(Err(e)) => anyhow::bail!("Read error: {}", e),
+                Err(_) => anyhow::bail!("Timeout waiting for MCP response"),
             }
-            Ok(Err(e)) => anyhow::bail!("Read error: {}", e),
-            Err(_) => anyhow::bail!("Timeout waiting for MCP response"),
         }
     }
 
     /// Spawn a stdio MCP process
     async fn spawn_stdio_process(
         &self,
+        id: Uuid,
         command: &str,
         args: &[String],
         env: &HashMap<String, String>,
@@ -688,6 +849,23 @@ impl McpRegistry {
 
         let stdout_lines = Arc::new(Mutex::new(BufReader::new(stdout)));
 
+        // Drain stderr into the log buffer. Left unread, a chatty server
+        // fills the pipe and blocks.
+        if let Some(stderr) = child.stderr.take() {
+            let logs = Arc::clone(&self.logs);
+            tokio::spawn(async move {
+                let mut reader = BufReader::new(stderr);
+                let mut line = Vec::new();
+                loop {
+                    line.clear();
+                    match reader.read_until(b'\n', &mut line).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) => logs.push(id, McpLogKind::Stderr, &String::from_utf8_lossy(&line)),
+                    }
+                }
+            });
+        }
+
         Ok(StdioProcess {
             child,
             stdin,
@@ -698,6 +876,7 @@ impl McpRegistry {
     /// Initialize connection with an MCP server (HTTP)
     async fn initialize_mcp_http(
         &self,
+        mcp_id: Uuid,
         endpoint: &str,
         headers: &HashMap<String, String>,
     ) -> anyhow::Result<InitializeResult> {
@@ -710,8 +889,12 @@ impl McpRegistry {
             },
         };
 
+        // A new initialize starts a new session.
+        self.http_sessions.write().await.remove(&mcp_id);
+
         let result = self
             .send_jsonrpc_http(
+                mcp_id,
                 endpoint,
                 "initialize",
                 Some(serde_json::to_value(params)?),
@@ -722,21 +905,16 @@ impl McpRegistry {
         let init_result: InitializeResult = serde_json::from_value(result)?;
 
         // Send initialized notification (no response expected, but some servers require it)
-        let mut req_builder = self
-            .http_client
-            .post(endpoint)
-            .header("Content-Type", "application/json");
-
-        for (key, value) in headers {
-            req_builder = req_builder.header(key.as_str(), value.as_str());
-        }
-
-        let _ = req_builder
-            .json(&serde_json::json!({
-                "jsonrpc": "2.0",
-                "method": "notifications/initialized"
-            }))
-            .send()
+        let _ = self
+            .post_http(
+                mcp_id,
+                endpoint,
+                headers,
+                &serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "method": "notifications/initialized"
+                }),
+            )
             .await;
 
         Ok(init_result)
@@ -815,6 +993,7 @@ impl McpRegistry {
         let id = config.id;
 
         // Create runtime state
+        self.logs.register(id, &config.transport);
         let state = McpServerState::from_config(config.clone());
 
         // Add to states
@@ -843,6 +1022,8 @@ impl McpRegistry {
 
         // Remove from states
         self.states.write().await.remove(&id);
+        self.http_sessions.write().await.remove(&id);
+        self.logs.remove(id);
 
         Ok(())
     }
@@ -891,6 +1072,8 @@ impl McpRegistry {
                 state.error = None;
             }
         }
+        self.http_sessions.write().await.remove(&id);
+        self.logs.event(id, "Disabled");
 
         self.get(id)
             .await
@@ -942,6 +1125,7 @@ impl McpRegistry {
             .await?;
 
         // Update runtime state
+        self.logs.register(id, &config.transport);
         {
             let mut states = self.states.write().await;
             if let Some(state) = states.get_mut(&id) {
@@ -965,6 +1149,9 @@ impl McpRegistry {
 
     /// Helper to update state with error - retries a few times to handle lock contention
     async fn update_state_error(&self, id: Uuid, error_msg: String) {
+        // Server-supplied error text can echo configured credentials.
+        let error_msg = self.logs.redact(id, &error_msg);
+        self.logs.event(id, &format!("Error: {}", error_msg));
         // Try up to 5 times with small delays to handle temporary lock contention
         for attempt in 0..5 {
             if let Ok(mut states) = self.states.try_write() {
@@ -991,6 +1178,17 @@ impl McpRegistry {
         server_version: Option<String>,
     ) {
         let tool_names: Vec<String> = tool_descriptors.iter().map(|t| t.name.clone()).collect();
+        self.logs.event(
+            id,
+            &format!(
+                "Connected: {} tool(s){}",
+                tool_names.len(),
+                server_version
+                    .as_deref()
+                    .map(|v| format!(", server version {}", v))
+                    .unwrap_or_default()
+            ),
+        );
 
         // Try up to 5 times with small delays to handle temporary lock contention
         for attempt in 0..5 {
@@ -1025,6 +1223,11 @@ impl McpRegistry {
             return Ok(state);
         }
 
+        self.logs.event(
+            id,
+            &format!("Refreshing ({})", transport_label(&state.config.transport)),
+        );
+
         match &state.config.transport {
             McpTransport::Http { endpoint, headers } => {
                 self.refresh_http(id, endpoint.clone(), headers.clone())
@@ -1047,7 +1250,7 @@ impl McpRegistry {
         let endpoint = endpoint.trim_end_matches('/').to_string();
 
         // Step 1: Initialize the MCP connection with JSON-RPC
-        let init_result = match self.initialize_mcp_http(&endpoint, &headers).await {
+        let init_result = match self.initialize_mcp_http(id, &endpoint, &headers).await {
             Ok(result) => result,
             Err(e) => {
                 self.update_state_error(id, format!("Initialize failed: {}", e))
@@ -1067,7 +1270,7 @@ impl McpRegistry {
 
         // Step 2: List tools using JSON-RPC
         match self
-            .send_jsonrpc_http(&endpoint, "tools/list", None, &headers)
+            .send_jsonrpc_http(id, &endpoint, "tools/list", None, &headers)
             .await
         {
             Ok(result) => {
@@ -1127,7 +1330,7 @@ impl McpRegistry {
         }
 
         // Spawn new process
-        let process = match self.spawn_stdio_process(&command, &args, &env).await {
+        let process = match self.spawn_stdio_process(id, &command, &args, &env).await {
             Ok(p) => Arc::new(Mutex::new(p)),
             Err(e) => {
                 self.update_state_error(id, format!("Failed to spawn process: {}", e))
@@ -1261,7 +1464,7 @@ impl McpRegistry {
         let result = match &state.config.transport {
             McpTransport::Http { endpoint, headers } => {
                 let endpoint = endpoint.trim_end_matches('/');
-                self.send_jsonrpc_http(endpoint, "tools/call", Some(params), headers)
+                self.send_jsonrpc_http(mcp_id, endpoint, "tools/call", Some(params), headers)
                     .await
             }
             McpTransport::Stdio { .. } => {
@@ -1312,10 +1515,14 @@ impl McpRegistry {
             }
             Err(e) => {
                 // Increment error counter
-                let mut states = self.states.write().await;
-                if let Some(state) = states.get_mut(&mcp_id) {
-                    state.tool_errors += 1;
+                {
+                    let mut states = self.states.write().await;
+                    if let Some(state) = states.get_mut(&mcp_id) {
+                        state.tool_errors += 1;
+                    }
                 }
+                self.logs
+                    .event(mcp_id, &format!("tools/call {} failed: {}", tool_name, e));
                 anyhow::bail!("Tool call failed: {}", e);
             }
         }
@@ -1421,6 +1628,209 @@ impl McpRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sse_events_are_split_and_data_lines_joined() {
+        let mut buffer = b"event: message\ndata: {\"a\":\ndata: 1}\n\ndata: x".to_vec();
+        assert_eq!(take_sse_event(&mut buffer).as_deref(), Some("{\"a\":\n1}"));
+        // An incomplete event stays buffered.
+        assert_eq!(take_sse_event(&mut buffer), None);
+        assert_eq!(buffer, b"data: x");
+    }
+
+    #[test]
+    fn matching_response_skips_notifications_requests_and_other_ids() {
+        let notification = r#"{"jsonrpc":"2.0","method":"notifications/message","params":{}}"#;
+        let server_request = r#"{"jsonrpc":"2.0","id":7,"method":"roots/list"}"#;
+        let other = r#"{"jsonrpc":"2.0","id":8,"result":{}}"#;
+        let ours = r#"{"jsonrpc":"2.0","id":7,"result":{"ok":true}}"#;
+        assert!(parse_matching_response(notification, 7).is_none());
+        assert!(parse_matching_response(server_request, 7).is_none());
+        assert!(parse_matching_response(other, 7).is_none());
+        assert!(parse_matching_response("not json", 7).is_none());
+        let found = parse_matching_response(ours, 7).expect("response");
+        assert_eq!(found.result, Some(serde_json::json!({"ok": true})));
+        let null_id_error =
+            r#"{"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":"Parse error"}}"#;
+        let found = parse_matching_response(null_id_error, 7).expect("null-id error");
+        assert_eq!(found.error.map(|e| e.code), Some(-32700));
+        let null_id_result = r#"{"jsonrpc":"2.0","id":null,"result":{}}"#;
+        assert!(parse_matching_response(null_id_result, 7).is_none());
+        let batch = format!("[{notification},{ours}]");
+        assert!(parse_matching_response(&batch, 7).is_some());
+    }
+
+    #[test]
+    fn transport_label_omits_paths_queries_args_and_env() {
+        let http = McpTransport::Http {
+            endpoint: "https://mcp.example.com:8443/v1/mcp?token=secret".to_string(),
+            headers: HashMap::from([("Authorization".to_string(), "Bearer x".to_string())]),
+        };
+        assert_eq!(transport_label(&http), "http https://mcp.example.com:8443");
+        let stdio = McpTransport::Stdio {
+            command: "/usr/bin/npx".to_string(),
+            args: vec!["--token=secret".to_string()],
+            env: HashMap::from([("API_KEY".to_string(), "secret".to_string())]),
+        };
+        assert_eq!(transport_label(&stdio), "stdio npx");
+    }
+
+    async fn add_and_refresh(registry: &McpRegistry, transport: McpTransport) -> McpServerState {
+        let added = registry
+            .add(AddMcpRequest {
+                name: "probe-test".to_string(),
+                transport,
+                description: None,
+                scope: None,
+                default_enabled: None,
+                workspace_env_allowlist: Vec::new(),
+            })
+            .await
+            .expect("add");
+        registry.refresh(added.config.id).await.expect("refresh")
+    }
+
+    /// A Streamable HTTP server: rejects requests that don't accept SSE,
+    /// assigns a session at initialize, requires it afterwards, and answers
+    /// over SSE with a notification ahead of the response.
+    #[tokio::test]
+    async fn refresh_connects_to_streamable_http_server() {
+        use axum::http::{HeaderMap, StatusCode};
+        use axum::response::{IntoResponse, Response};
+
+        async fn handler(headers: HeaderMap, body: String) -> Response {
+            let accept = headers
+                .get("accept")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("");
+            if !(accept.contains("application/json") && accept.contains("text/event-stream")) {
+                return StatusCode::NOT_ACCEPTABLE.into_response();
+            }
+            let message: serde_json::Value = serde_json::from_str(&body).unwrap();
+            let method = message["method"].as_str().unwrap_or("");
+            let session = headers.get("mcp-session-id").and_then(|v| v.to_str().ok());
+            if method != "initialize" && session != Some("session-1") {
+                return StatusCode::BAD_REQUEST.into_response();
+            }
+            let result = match method {
+                "initialize" => serde_json::json!({
+                    "protocolVersion": MCP_PROTOCOL_VERSION,
+                    "capabilities": {},
+                    "serverInfo": {"name": "test", "version": "1.2.3"}
+                }),
+                "tools/list" => serde_json::json!({"tools": [{"name": "echo", "inputSchema": {}}]}),
+                _ => return StatusCode::ACCEPTED.into_response(),
+            };
+            let response =
+                serde_json::json!({"jsonrpc": "2.0", "id": message["id"], "result": result});
+            let body = format!(
+                "event: message\r\ndata: {{\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\",\"params\":{{}}}}\r\n\r\nevent: message\r\ndata: {response}\r\n\r\n"
+            );
+            (
+                [
+                    ("content-type", "text/event-stream"),
+                    ("mcp-session-id", "session-1"),
+                ],
+                body,
+            )
+                .into_response()
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = axum::Router::new().route("/mcp", axum::routing::post(handler));
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let dir = tempfile::tempdir().unwrap();
+        let registry = McpRegistry::new(dir.path()).await;
+        let state = add_and_refresh(
+            &registry,
+            McpTransport::Http {
+                endpoint: format!("http://{addr}/mcp"),
+                headers: HashMap::new(),
+            },
+        )
+        .await;
+
+        assert_eq!(
+            state.status,
+            McpStatus::Connected,
+            "error: {:?}",
+            state.error
+        );
+        assert_eq!(state.config.tools, ["echo"]);
+        assert_eq!(state.config.version.as_deref(), Some("1.2.3"));
+        let logs = registry.logs(state.config.id, 10);
+        let messages: Vec<_> = logs.iter().map(|e| e.message.as_str()).collect();
+        assert_eq!(
+            messages,
+            [
+                format!("Refreshing (http http://{addr})").as_str(),
+                "Connected: 1 tool(s), server version 1.2.3"
+            ]
+        );
+    }
+
+    /// A stdio server that writes to stderr and sends a notification before
+    /// each initialize response.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn refresh_skips_stdio_notifications_and_captures_stderr() {
+        let script = r#"echo "booting" >&2
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+  [ -z "$id" ] && continue
+  case "$line" in
+    *'"initialize"'*)
+      printf '%s\n' '{"jsonrpc":"2.0","method":"notifications/message","params":{"level":"info","data":"hi"}}'
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2024-11-05","capabilities":{},"serverInfo":{"name":"t","version":"9"}}}\n' "$id" ;;
+    *'"tools/list"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":[{"name":"echo","inputSchema":{}}]}}\n' "$id" ;;
+  esac
+done
+"#;
+        let dir = tempfile::tempdir().unwrap();
+        let registry = McpRegistry::new(dir.path()).await;
+        let state = add_and_refresh(
+            &registry,
+            McpTransport::Stdio {
+                command: "sh".to_string(),
+                args: vec!["-c".to_string(), script.to_string()],
+                env: HashMap::new(),
+            },
+        )
+        .await;
+
+        assert_eq!(
+            state.status,
+            McpStatus::Connected,
+            "error: {:?}",
+            state.error
+        );
+        assert_eq!(state.config.tools, ["echo"]);
+
+        // The stderr reader runs concurrently; give it a moment.
+        let id = state.config.id;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while !registry
+            .logs(id, 50)
+            .iter()
+            .any(|e| e.kind == McpLogKind::Stderr && e.message == "booting")
+        {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "stderr not captured"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(registry
+            .logs(id, 50)
+            .iter()
+            .any(|e| e.message == "Refreshing (stdio sh)"));
+
+        registry.remove(id).await.unwrap();
+        assert!(registry.logs(id, 50).is_empty());
+    }
 
     #[test]
     fn builtin_workspace_mcp_receives_full_workspace_environment() {

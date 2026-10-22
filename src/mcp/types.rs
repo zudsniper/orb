@@ -252,6 +252,50 @@ impl McpServerConfig {
     }
 }
 
+/// Secret-free view of an MCP for clients that only display it: no
+/// command, args, env, endpoint or headers.
+#[derive(Debug, Clone, Serialize)]
+pub struct McpSummary {
+    pub id: Uuid,
+    pub name: String,
+    /// `"http"` or `"stdio"`
+    pub transport: &'static str,
+    pub scope: McpScope,
+    pub description: Option<String>,
+    pub default_enabled: bool,
+    pub version: Option<String>,
+    pub tools: Vec<String>,
+    pub last_connected_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub status: McpStatus,
+    pub error: Option<String>,
+    pub tool_calls: u64,
+    pub tool_errors: u64,
+}
+
+impl From<&McpServerState> for McpSummary {
+    fn from(state: &McpServerState) -> Self {
+        let config = &state.config;
+        Self {
+            id: config.id,
+            name: config.name.clone(),
+            transport: match config.transport {
+                McpTransport::Http { .. } => "http",
+                McpTransport::Stdio { .. } => "stdio",
+            },
+            scope: config.scope,
+            description: config.description.clone(),
+            default_enabled: config.default_enabled,
+            version: config.version.clone(),
+            tools: config.tools.clone(),
+            last_connected_at: config.last_connected_at,
+            status: state.status,
+            error: state.error.clone(),
+            tool_calls: state.tool_calls,
+            tool_errors: state.tool_errors,
+        }
+    }
+}
+
 /// Runtime state of an MCP server (not persisted).
 #[derive(Debug, Clone, Serialize)]
 pub struct McpServerState {
@@ -375,4 +419,42 @@ pub struct McpContent {
     pub data: Option<String>,
     #[serde(default)]
     pub mime_type: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn summary_omits_transport_details() {
+        let mut config = McpServerConfig::new_stdio(
+            "secret-holder".to_string(),
+            "/opt/bin/server".to_string(),
+            vec!["--token=arg-secret".to_string()],
+            std::collections::HashMap::from([("API_KEY".to_string(), "env-secret".to_string())]),
+        );
+        config.tools = vec!["echo".to_string()];
+        let state = McpServerState::from_config(config);
+        let json = serde_json::to_string(&McpSummary::from(&state)).unwrap();
+        assert!(json.contains(r#""transport":"stdio""#));
+        assert!(json.contains(r#""tools":["echo"]"#));
+        for secret in ["arg-secret", "env-secret", "/opt/bin/server", "API_KEY"] {
+            assert!(!json.contains(secret), "summary leaked {secret}: {json}");
+        }
+
+        let mut http = McpServerConfig::new(
+            "remote".to_string(),
+            "https://mcp.example.com/mcp?key=url-secret".to_string(),
+        );
+        if let McpTransport::Http { headers, .. } = &mut http.transport {
+            headers.insert(
+                "Authorization".to_string(),
+                "Bearer header-secret".to_string(),
+            );
+        }
+        let json =
+            serde_json::to_string(&McpSummary::from(&McpServerState::from_config(http))).unwrap();
+        assert!(json.contains(r#""transport":"http""#));
+        assert!(!json.contains("url-secret") && !json.contains("header-secret"));
+    }
 }

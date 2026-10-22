@@ -4,9 +4,11 @@
 //! Configurations are persisted to `{working_dir}/.sandboxed-sh/mcp/config.json`.
 
 mod config;
+mod logs;
 mod registry;
 mod types;
 
 pub use config::McpConfigStore;
+pub use logs::{McpLogEntry, McpLogKind};
 pub use registry::McpRegistry;
 pub use types::*;
