@@ -9,4 +9,4 @@
 .mcp-row > summary > svg { flex: none; margin-left: auto; color: var(--fg-3); }
 .mcp-row[open] > summary > svg { transform: rotate(180deg); }
 .mcp-row .mcp-error { color: var(--red); overflow-wrap: anywhere; }
-.mcp-detail { padding-left: 30px; }
+.mcp-row .mcp-detail { padding-left: 30px; }

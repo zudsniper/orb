@@ -106,4 +106,5 @@ export function mcpStatusView(m: Pick<McpSummary, "status" | "scope">): McpStatu
   }
 }
 
-export const mcpLogLine = (e: McpLogEntry) => `${e.at} ${e.kind === "stderr" ? "stderr" : "core  "} ${e.message}`;
+/** One log line: UTC time to the second, source, message. */
+export const mcpLogLine = (e: McpLogEntry) => `${e.at.replace(/\.\d+Z$/, "Z")} ${e.kind === "stderr" ? "stderr" : "core  "} ${e.message}`;
