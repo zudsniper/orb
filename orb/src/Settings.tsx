@@ -10,6 +10,7 @@ import { clearConnection, connectionVersion, getApiUrl, getJwt, isConnected, log
 import { localInstalled, pathOverrides, refreshLocalAgents, setPathOverride, tauriInvoke } from "./localAgents";
 import { nativeInvoke } from "./native";
 import { DebugInfoPanel } from "./DebugInfo";
+import { McpServersPanel } from "./McpServers";
 import { getThemePref, setThemePref, type ThemePref } from "./theme";
 
 const THEME_LABELS: Record<ThemePref, string> = { auto: "Auto", light: "Light", dark: "Dark" };
@@ -277,6 +278,7 @@ function DiagnosticsCard() {
 
 export function Settings(p: { onOpenPage?: (id: string) => void } = {}) {
   const [executionMounted, setExecutionMounted] = createSignal(false);
+  const [mcpMounted, setMcpMounted] = createSignal(false);
   return (
     <div class="s-body settings-body">
       <div class="s-inner">
@@ -294,6 +296,16 @@ export function Settings(p: { onOpenPage?: (id: string) => void } = {}) {
                 <Ic.ChevronDown size={14} />
               </summary>
               <Show when={executionMounted()}><ExecutionSettings inline /></Show>
+            </details>
+          </section>
+          <section class="s-sec">
+            <h3>MCP servers</h3>
+            <details class="s-card debug-disclosure" onToggle={e => { if (e.currentTarget.open) setMcpMounted(true); }}>
+              <summary class="s-row">
+                <span class="s-row-text"><span class="s-row-title">Servers by workspace</span><span class="s-row-desc">Which MCP servers missions get, with status and logs.</span></span>
+                <Ic.ChevronDown size={14} />
+              </summary>
+              <Show when={mcpMounted()}><McpServersPanel /></Show>
             </details>
           </section>
         </Show>

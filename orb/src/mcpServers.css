@@ -1,0 +1,12 @@
+/* Settings → MCP servers (McpServers.tsx). Rows reuse s-row, m-dot and debug-info*. */
+.mcp-servers { display: flex; flex-direction: column; min-width: 0; }
+.mcp-servers-head { display: flex; align-items: center; gap: 12px; padding: 8px 12px; }
+.mcp-servers-head > .s-row-desc { flex: 1; min-width: 0; }
+.mcp-servers-msg { padding: 4px 12px 12px; }
+.mcp-row > summary { cursor: pointer; list-style: none; gap: 10px; align-items: center; }
+.mcp-row > summary::-webkit-details-marker { display: none; }
+.mcp-row > summary .s-row-title, .mcp-row > summary .s-row-desc { display: block; }
+.mcp-row > summary > svg { flex: none; margin-left: auto; color: var(--fg-3); }
+.mcp-row[open] > summary > svg { transform: rotate(180deg); }
+.mcp-row .mcp-error { color: var(--red); overflow-wrap: anywhere; }
+.mcp-detail { padding-left: 30px; }
